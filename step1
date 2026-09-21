@@ -7,7 +7,7 @@ SELECT
     table_name,
     table_type,
     data_source_format
-FROM member_admin_main_qa_000.information_schema.tables
+FROM m_admin_main.information_schema.tables
 ORDER BY table_schema, table_name;
 
 Unity Catalog's information_schema.tables gives you tables/views you have permission to see, including their table type and data format.
@@ -44,7 +44,7 @@ What is the largest table?
 
 Run this PySpark code:
 
-source_catalog = "member_admin_main_qa_000"
+source_catalog = "m_admin_main"
 
 tables = spark.sql(f"""
 SELECT
@@ -180,7 +180,7 @@ If your company compute policy only gives you certain Azure VM types, use whiche
 
 If you have permission:
 
-CREATE CATALOG IF NOT EXISTS member_admin_main_qa_000_clone;
+CREATE CATALOG IF NOT EXISTS m_admin_main_clone;
 
 If that fails with a privilege error, catalog creation probably needs to be done by your Unity Catalog admin.
 
@@ -188,8 +188,8 @@ If that fails with a privilege error, catalog creation probably needs to be done
 
 Use Python:
 
-source_catalog = "member_admin_main_qa_000"
-target_catalog = "member_admin_main_qa_000_clone"
+source_catalog = "m_admin_main"
+target_catalog = "m_admin_main"
 
 schemas = spark.sql(f"""
 SELECT schema_name
@@ -209,14 +209,14 @@ for row in schemas:
 
 Now structurally you have:
 
-member_admin_main_qa_000
+m_admin_main
    schema_A
    schema_B
    schema_C
 
               ↓
 
-member_admin_main_qa_000_clone
+m_admin_main
    schema_A
    schema_B
    schema_C
@@ -228,8 +228,8 @@ Use:
 
 import time
 
-source_catalog = "member_admin_main_qa_000"
-target_catalog = "member_admin_main_qa_000_clone"
+source_catalog = "m_admin_main"
+target_catalog = "m_admin_main"
 
 tables = spark.sql(f"""
 SELECT
