@@ -1,0 +1,501 @@
+1. First, see what is actually in the catalog
+
+Run this in a SQL cell:
+
+SELECT
+    table_schema,
+    table_name,
+    table_type,
+    data_source_format
+FROM member_admin_main_qa_000.information_schema.tables
+ORDER BY table_schema, table_name;
+
+Unity Catalog's information_schema.tables gives you tables/views you have permission to see, including their table type and data format.
+
+Pay particular attention to:
+
+TABLE_TYPE
+MANAGED
+EXTERNAL
+VIEW
+STREAMING_TABLE
+MATERIALIZED_VIEW
+
+DATA_SOURCE_FORMAT
+DELTA
+PARQUET
+...
+
+For the first exercise, focus on normal Delta MANAGED/EXTERNAL tables.
+
+2. Find total size before deciding worker count
+
+This is important.
+
+Don't start by saying, "I'll use 10 workers."
+
+First determine:
+
+How many tables?
+How much data?
+How many files?
+Are there many tiny files?
+What is the largest table?
+
+Run this PySpark code:
+
+source_catalog = "member_admin_main_qa_000"
+
+tables = spark.sql(f"""
+SELECT
+    table_schema,
+    table_name,
+    table_type,
+    data_source_format
+FROM `{source_catalog}`.information_schema.tables
+WHERE table_type IN ('MANAGED', 'EXTERNAL')
+  AND data_source_format = 'DELTA'
+ORDER BY table_schema, table_name
+""").collect()
+
+print("Number of Delta tables:", len(tables))
+
+Then collect the physical sizes:
+
+inventory = []
+
+for t in tables:
+    schema = t["table_schema"]
+    table = t["table_name"]
+
+    full_name = f"`{source_catalog}`.`{schema}`.`{table}`"
+
+    try:
+        detail = spark.sql(
+            f"DESCRIBE DETAIL {full_name}"
+        ).first()
+
+        inventory.append({
+            "schema": schema,
+            "table": table,
+            "size_bytes": detail["sizeInBytes"],
+            "num_files": detail["numFiles"]
+        })
+
+    except Exception as e:
+        print(f"Could not inspect {full_name}: {e}")
+
+Display it:
+
+inventory_df = spark.createDataFrame(inventory)
+
+display(
+    inventory_df.orderBy("size_bytes", ascending=False)
+)
+
+And get totals:
+
+from pyspark.sql import functions as F
+
+display(
+    inventory_df.agg(
+        F.sum("size_bytes").alias("total_bytes"),
+        F.sum("num_files").alias("total_files"),
+        F.count("*").alias("table_count")
+    )
+)
+
+You can make GB/TB easier to read:
+
+display(
+    inventory_df
+    .withColumn(
+        "size_gb",
+        F.round(F.col("size_bytes") / (1024**3), 2)
+    )
+    .orderBy(F.desc("size_gb"))
+)
+3. Choosing workers, cores and RAM
+
+This is where your Spark UI experiment becomes useful.
+
+There isn't a formula like:
+
+1 TB = exactly 8 workers
+
+because performance also depends heavily on:
+
+number of files
+file sizes
+storage throughput
+network throughput
+table layout
+concurrent workload
+VM family
+Delta metadata
+
+For DEEP CLONE, the workload is heavily related to storage I/O and file copying rather than complicated transformations.
+
+As a practical starting benchmark, I would use roughly:
+
+Source data	Starting point
+< 100 GB	2 workers
+100–500 GB	2–4 workers
+500 GB–1 TB	4–8 workers
+1–5 TB	8–16 workers
+> 5 TB	Benchmark before going larger
+
+These are starting points, not Databricks guarantees.
+
+For example, a reasonable worker might have:
+
+8 cores
+32 GB RAM
+
+and 4 workers would give approximately:
+
+4 workers × 8 cores
+= 32 worker cores
+
+4 workers × 32 GB
+= 128 GB worker memory
+
+plus the driver.
+
+Databricks runs Spark executors on the workers and currently describes classic multi-node compute as one executor per worker. Databricks also supports autoscaling where you specify min/max workers and Databricks adjusts within that range.
+
+For your first test, I'd prefer something like:
+
+Driver: 8 cores / ~32 GB
+Workers: 4
+Worker: 8 cores / ~32 GB
+Total worker cores: ~32
+Total worker RAM: ~128 GB
+
+Then benchmark.
+
+If your company compute policy only gives you certain Azure VM types, use whichever equivalent configuration is available rather than trying to match these numbers exactly.
+
+4. Create the new catalog
+
+If you have permission:
+
+CREATE CATALOG IF NOT EXISTS member_admin_main_qa_000_clone;
+
+If that fails with a privilege error, catalog creation probably needs to be done by your Unity Catalog admin.
+
+5. Automatically create all schemas
+
+Use Python:
+
+source_catalog = "member_admin_main_qa_000"
+target_catalog = "member_admin_main_qa_000_clone"
+
+schemas = spark.sql(f"""
+SELECT schema_name
+FROM `{source_catalog}`.information_schema.schemata
+WHERE schema_name <> 'information_schema'
+""").collect()
+
+for row in schemas:
+    schema = row["schema_name"]
+
+    print(f"Creating schema: {schema}")
+
+    spark.sql(f"""
+        CREATE SCHEMA IF NOT EXISTS
+        `{target_catalog}`.`{schema}`
+    """)
+
+Now structurally you have:
+
+member_admin_main_qa_000
+   schema_A
+   schema_B
+   schema_C
+
+              ↓
+
+member_admin_main_qa_000_clone
+   schema_A
+   schema_B
+   schema_C
+6. Deep-clone every Delta table and measure the time
+
+This is the important part.
+
+Use:
+
+import time
+
+source_catalog = "member_admin_main_qa_000"
+target_catalog = "member_admin_main_qa_000_clone"
+
+tables = spark.sql(f"""
+SELECT
+    table_schema,
+    table_name
+FROM `{source_catalog}`.information_schema.tables
+WHERE table_type IN ('MANAGED', 'EXTERNAL')
+  AND data_source_format = 'DELTA'
+ORDER BY table_schema, table_name
+""").collect()
+
+clone_results = []
+
+for t in tables:
+
+    schema = t["table_schema"]
+    table = t["table_name"]
+
+    source_table = (
+        f"`{source_catalog}`.`{schema}`.`{table}`"
+    )
+
+    target_table = (
+        f"`{target_catalog}`.`{schema}`.`{table}`"
+    )
+
+    print("=" * 80)
+    print(f"Cloning: {source_table}")
+    print(f"Target : {target_table}")
+
+    start = time.perf_counter()
+
+    try:
+
+        clone_result = spark.sql(f"""
+            CREATE OR REPLACE TABLE {target_table}
+            DEEP CLONE {source_table}
+        """).first()
+
+        elapsed = time.perf_counter() - start
+
+        clone_results.append({
+            "schema": schema,
+            "table": table,
+            "duration_seconds": round(elapsed, 2),
+            "source_size_bytes": clone_result["source_table_size"],
+            "source_files": clone_result["source_num_of_files"],
+            "copied_files": clone_result["num_copied_files"],
+            "copied_bytes": clone_result["copied_files_size"],
+            "status": "SUCCESS"
+        })
+
+        print(f"Completed in {elapsed:.2f} seconds")
+
+    except Exception as e:
+
+        elapsed = time.perf_counter() - start
+
+        clone_results.append({
+            "schema": schema,
+            "table": table,
+            "duration_seconds": round(elapsed, 2),
+            "source_size_bytes": None,
+            "source_files": None,
+            "copied_files": None,
+            "copied_bytes": None,
+            "status": f"FAILED: {str(e)[:500]}"
+        })
+
+        print(f"FAILED: {e}")
+
+This is especially useful because Databricks itself returns clone metrics including source_table_size, source_num_of_files, num_copied_files, and copied_files_size.
+
+Then:
+
+clone_results_df = spark.createDataFrame(clone_results)
+
+display(
+    clone_results_df.orderBy(
+        "duration_seconds",
+        ascending=False
+    )
+)
+
+Add MB/s throughput:
+
+from pyspark.sql import functions as F
+
+benchmark_df = (
+    clone_results_df
+    .withColumn(
+        "copied_gb",
+        F.round(F.col("copied_bytes") / (1024**3), 2)
+    )
+    .withColumn(
+        "throughput_mb_sec",
+        F.round(
+            (F.col("copied_bytes") / (1024**2))
+            / F.col("duration_seconds"),
+            2
+        )
+    )
+)
+
+display(
+    benchmark_df.orderBy(
+        F.desc("duration_seconds")
+    )
+)
+
+Now you get something useful like:
+
+Table          Size GB   Files    Time sec   MB/sec
+---------------------------------------------------
+member         350       7,400      480       747
+claims         190       3,100      245       794
+group           60       1,200       80       768
+provider        12         300       22       558
+
+Now we're actually doing performance engineering rather than guessing.
+
+7. Measure total catalog clone time
+
+Surround the entire loop with:
+
+catalog_start = time.perf_counter()
+
+# cloning loop
+
+catalog_elapsed = time.perf_counter() - catalog_start
+
+print(
+    f"Total catalog clone time: "
+    f"{catalog_elapsed / 60:.2f} minutes"
+)
+
+So if the result is:
+
+Total catalog clone time: 43.7 minutes
+
+you have your baseline.
+
+8. Then go directly to Spark UI
+
+This matches your original goal.
+
+While the clone is running, or immediately afterward:
+
+Compute
+   ↓
+Your compute
+   ↓
+Spark UI
+
+Look at:
+
+Jobs
+Stages
+Executors
+SQL / DataFrame
+
+The Spark UI shows jobs, stages, tasks, their progress, and execution details, while compute metrics can show CPU, memory, disk, network throughput, and active nodes.
+
+For example:
+
+Job
+ ↓
+Stage 1
+ ├── Task 1 → Worker 1
+ ├── Task 2 → Worker 2
+ ├── Task 3 → Worker 3
+ └── Task 4 → Worker 4
+
+What we want to investigate is whether all workers are actually busy. Databricks specifically recommends checking whether tasks are distributed across multiple executors when investigating parallelism.
+
+9. How to determine whether you need more workers
+
+Suppose we start with:
+
+4 workers
+8 cores each
+32 GB each
+
+Run the catalog clone and record:
+
+Time = 50 minutes
+
+Then try:
+
+8 workers
+8 cores each
+32 GB each
+
+Maybe:
+
+Time = 31 minutes
+
+Then:
+
+16 workers
+
+Maybe:
+
+Time = 28 minutes
+
+That tells you something important.
+
+From:
+
+4 → 8 workers
+50 → 31 minutes
+
+you got a substantial improvement.
+
+But:
+
+8 → 16 workers
+31 → 28 minutes
+
+barely helped.
+
+So 8 workers is probably closer to the useful point for this workload. Adding workers beyond that may mostly increase cost rather than performance.
+
+That's the kind of conclusion you want to make from your Spark UI and benchmark numbers.
+
+One important distinction
+
+If this new catalog is only for temporary testing and you don't actually need another physical copy of all the data, consider:
+
+CREATE TABLE target
+SHALLOW CLONE source;
+
+versus:
+
+CREATE TABLE target
+DEEP CLONE source;
+
+Conceptually:
+
+                    DEEP CLONE
+
+Source Catalog                    Target Catalog
+┌────────────┐                    ┌────────────┐
+│ Metadata A │                    │ Metadata B │
+│ Data A     │ ─── COPY ───────→ │ Data B     │
+└────────────┘                    └────────────┘
+
+Independent physical data
+
+
+                  SHALLOW CLONE
+
+Source Catalog                    Target Catalog
+┌────────────┐                    ┌────────────┐
+│ Metadata A │ ← referenced by ── │ Metadata B │
+│ Data A     │                    │ No copy    │
+└────────────┘                    └────────────┘
+
+Deep clone is what I would use when you literally mean "copy all the data to another catalog." Shallow clone is much cheaper and faster if you're simply creating an isolated logical testing table.
+
+Also note that CLONE is a table operation, not a one-command catalog clone. Views, streaming tables, materialized views, Unity Catalog permissions, tags, and other catalog-level objects need separate handling; streaming tables and materialized views specifically do not support CLONE.
+
+For your project, I would first run the inventory section only. Once you know number of Delta tables, total GB/TB, total files, and largest table, we can choose a much more defensible worker/core/RAM configuration instead of guessing.
+
+TABLE_TYPE MANAGED EXTERNAL VIEW  
+
+DATA_SOURCE_FORMAT DELTA  unknown_data_source_format
+
+
